@@ -1,11 +1,12 @@
 import json
 import os
 import socket
+import time
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 
 PORT = int(os.environ.get('PORT', 8000))
 DB_FILE = 'leaderboard.json'
-TRADE_FILE = 'trades.json'
+TRADE_ROOMS_FILE = 'trade_rooms.json'
 
 # Load Leaderboard
 if os.path.exists(DB_FILE):
@@ -17,23 +18,12 @@ if os.path.exists(DB_FILE):
 else:
     leaderboard = []
 
-# Load Active Trades
-if os.path.exists(TRADE_FILE):
-    with open(TRADE_FILE, 'r') as f:
-        try:
-            trades = json.load(f)
-        except:
-            trades = []
-else:
-    trades = []
+# Trade Rooms State (InMemory for speed, could be persisted)
+trade_rooms = {}
 
 def save_leaderboard():
     with open(DB_FILE, 'w') as f:
         json.dump(leaderboard, f)
-
-def save_trades():
-    with open(TRADE_FILE, 'w') as f:
-        json.dump(trades, f)
 
 class GameServer(SimpleHTTPRequestHandler):
     def do_OPTIONS(self):
@@ -52,7 +42,24 @@ class GameServer(SimpleHTTPRequestHandler):
             sorted_lb = sorted(leaderboard, key=lambda x: (x.get('wave', 0), x.get('money', 0)), reverse=True)[:100]
             self.wfile.write(json.dumps(sorted_lb).encode('utf-8'))
             
-        elif self.path.startswith('/api/get_trades'):
+        elif self.path.startswith('/api/trade_room'):
+            # Usage: /api/trade_room?id=RoomID
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            room_id = query.get('id', [None])[0]
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            
+            if room_id in trade_rooms:
+                self.wfile.write(json.dumps(trade_rooms[room_id]).encode('utf-8'))
+            else:
+                self.wfile.write(json.dumps({"error": "Room not found"}).encode('utf-8'))
+        
+        elif self.path.startswith('/api/find_trade'):
+            # Check if anyone is inviting YOU
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
             user = query.get('user', [None])[0]
@@ -62,11 +69,11 @@ class GameServer(SimpleHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             
-            if user:
-                user_trades = [t for t in trades if t['to'] == user and t['status'] == 'pending']
-                self.wfile.write(json.dumps(user_trades).encode('utf-8'))
-            else:
-                self.wfile.write(json.dumps([]).encode('utf-8'))
+            invites = []
+            for rid, room in trade_rooms.items():
+                if room['to'] == user and room['status'] == 'inviting':
+                    invites.append(room)
+            self.wfile.write(json.dumps(invites).encode('utf-8'))
         else:
             super().do_GET()
             
@@ -78,69 +85,81 @@ class GameServer(SimpleHTTPRequestHandler):
             try:
                 data = json.loads(post_data.decode('utf-8'))
                 user = data.get('user')
-                wave = data.get('wave', 0)
-                money = data.get('money', 0)
                 if user:
                     found = False
                     for entry in leaderboard:
                         if entry['user'] == user:
-                            entry['wave'] = max(entry['wave'], wave)
-                            entry['money'] = max(entry['money'], money)
+                            entry['wave'] = max(entry['wave'], data.get('wave', 0))
+                            entry['money'] = max(entry['money'], data.get('money', 0))
                             found = True
                             break
                     if not found:
-                        leaderboard.append({'user': user, 'wave': wave, 'money': money})
+                        leaderboard.append({'user': user, 'wave': data.get('wave', 0), 'money': data.get('money', 0)})
                     save_leaderboard()
                 self.send_response(200)
-                self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "ok"}).encode('utf-8'))
-            except Exception as e:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-                
-        elif self.path == '/api/send_trade':
-            try:
-                data = json.loads(post_data.decode('utf-8'))
-                data['id'] = len(trades) + 1
-                data['status'] = 'pending'
-                trades.append(data)
-                save_trades()
-                
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "ok", "id": data['id']}).encode('utf-8'))
-            except Exception as e:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+            except:
+                self.send_response(400); self.end_headers()
 
-        elif self.path == '/api/complete_trade':
+        elif self.path == '/api/create_trade':
             try:
                 data = json.loads(post_data.decode('utf-8'))
-                trade_id = data.get('tradeId')
-                action = data.get('action')
-                for t in trades:
-                    if t['id'] == trade_id:
-                        t['status'] = 'accepted' if action == 'accept' else 'declined'
-                        break
-                save_trades()
+                # { from: 'UserA', to: 'UserB' }
+                room_id = f"room_{int(time.time())}_{data['from']}"
+                trade_rooms[room_id] = {
+                    "id": room_id,
+                    "from": data['from'],
+                    "to": data['to'],
+                    "offer_from": [],
+                    "offer_to": [],
+                    "lock_from": False,
+                    "lock_to": False,
+                    "status": "inviting"
+                }
                 self.send_response(200)
-                self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok", "room_id": room_id}).encode('utf-8'))
+            except:
+                self.send_response(400); self.end_headers()
+
+        elif self.path == '/api/join_trade':
+            try:
+                data = json.loads(post_data.decode('utf-8'))
+                room_id = data['room_id']
+                if room_id in trade_rooms:
+                    trade_rooms[room_id]['status'] = 'active'
+                self.send_response(200); self.send_header('Access-Control-Allow-Origin', '*'); self.end_headers()
                 self.wfile.write(json.dumps({"status": "ok"}).encode('utf-8'))
-            except Exception as e:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+            except:
+                self.send_response(400); self.end_headers()
+
+        elif self.path == '/api/sync_trade':
+            try:
+                data = json.loads(post_data.decode('utf-8'))
+                # { room_id, user, offer, lock }
+                rid = data['room_id']
+                if rid in trade_rooms:
+                    room = trade_rooms[rid]
+                    if data['user'] == room['from']:
+                        room['offer_from'] = data['offer']
+                        room['lock_from'] = data['lock']
+                    else:
+                        room['offer_to'] = data['offer']
+                        room['lock_to'] = data['lock']
+                    
+                    if room['lock_from'] and room['lock_to']:
+                        room['status'] = 'completed'
+                
+                self.send_response(200); self.send_header('Access-Control-Allow-Origin', '*'); self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok"}).encode('utf-8'))
+            except:
+                self.send_response(400); self.end_headers()
 
 if __name__ == '__main__':
     server_address = ('0.0.0.0', PORT)
     httpd = HTTPServer(server_address, GameServer)
-    print(f"🚀 NEON STRIKE SERVER V2.0 RUNNING ON PORT {PORT}")
+    print(f"🚀 NEON STRIKE LIVE SERVER V3.0 RUNNING ON PORT {PORT}")
     httpd.serve_forever()
